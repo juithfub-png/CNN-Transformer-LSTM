@@ -1,0 +1,602 @@
+import pickle
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import biosppy.signals.tools as st
+import numpy as np
+import os
+import wfdb
+from biosppy.signals.ecg import correct_rpeaks, hamilton_segmenter
+from scipy.signal import medfilt
+from scipy.interpolate import splev, splrep
+from multiprocessing import cpu_count
+from tqdm import tqdm
+import warnings
+import time
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+warnings.filterwarnings('ignore')
+
+# ========== 配置参数 ==========
+# 根据论文3.1节和3.2节的描述配置
+base_dir = "/home/bwtc/WQ/OSA/MorphNet 1D-CNN SpO2/datasets/apnea-ecg"  # 原始数据路径
+output_dir = "/home/bwtc/WQ/OSA/CNN-Transformer-LSTM/output"  # 输出路径
+os.makedirs(output_dir, exist_ok=True)  # 确保输出目录存在
+
+# 根据论文3.2节：采样率100Hz，每个5分钟段包含900个RRI点和900个振幅点
+fs = 100  # 采样频率 (Hz)，符合论文描述
+sample = fs * 60  # 一分钟的样本点数
+before = 2  # 目标分钟前的上下文分钟数（5分钟段的前2分钟）
+after = 2  # 目标分钟后的上下文分钟数（5分钟段的后2分钟）
+hr_min = 20  # 最小合理心率
+hr_max = 300  # 最大合理心率
+# 根据论文3.2节："we obtained 900 points of RRI and 900 points for R amplitudes within each 5 min segment"
+segment_length = 900  # 5分钟段的插值点数（符合论文900点）
+
+num_worker = min(35, cpu_count() - 1)
+print(f"使用 {num_worker} 个工作进程")
+
+
+# ========== 根据论文方法的处理函数 ==========
+def preprocess_ecg_segment(signal, fs=100):
+    """根据论文3.2节预处理ECG信号段"""
+    try:
+        # 1. 滤波：论文中提到使用FIR带通滤波器
+        signal_filtered, _, _ = st.filter_signal(signal,
+                                                 ftype='FIR',
+                                                 band='bandpass',
+                                                 order=int(0.3 * fs),
+                                                 frequency=[3, 45],
+                                                 sampling_rate=fs)
+
+        # 2. R峰检测：使用Hamilton算法（论文3.2节提到）
+        rpeaks, = hamilton_segmenter(signal_filtered, sampling_rate=fs)
+        rpeaks, = correct_rpeaks(signal_filtered, rpeaks=rpeaks,
+                                 sampling_rate=fs, tol=0.1)
+
+        if len(rpeaks) < 4:  # 需要至少4个R峰才能进行插值
+            return None, None, None, None
+
+        # 3. 计算RR间期和R峰振幅
+        rri_tm = rpeaks[1:] / float(fs)  # RRI时间点（从第二个R峰开始）
+        rri_signal = np.diff(rpeaks) / float(fs)  # RRI值
+
+        # 4. 中值滤波去除异常值（论文3.2节提到）
+        if len(rri_signal) >= 3:
+            rri_signal = medfilt(rri_signal, kernel_size=3)
+
+        # 5. 提取R峰振幅
+        amp_tm = rpeaks / float(fs)
+        amp_signal = signal_filtered[rpeaks]
+
+        return rri_tm, rri_signal, amp_tm, amp_signal
+
+    except Exception as e:
+        print(f"预处理错误: {e}")
+        return None, None, None, None
+
+
+def extract_5min_segment_features(name, labels, is_test=False):
+    """
+    根据论文方法提取5分钟段的特征
+    论文中使用5分钟段（前2分钟+目标1分钟+后2分钟）
+    """
+    x_raw = []  # 存储原始特征
+    y = []  # 存储标签
+    groups = []  # 存储样本来源
+    segment_durations = []  # 存储段持续时间
+
+    # 读取ECG记录
+    record_path = os.path.join(base_dir, name)
+    try:
+        signals = wfdb.rdrecord(record_path, channels=[0]).p_signal[:, 0]
+    except Exception as e:
+        print(f"错误: 无法读取文件 {name}: {e}")
+        return [], [], [], [], []
+
+    total_minutes = len(signals) // (fs * 60)
+    print(f"记录 {name}: 总长度 {total_minutes} 分钟")
+
+    # 遍历每一分钟（目标分钟）
+    for target_minute in range(before, total_minutes - after):
+        try:
+            # 提取5分钟窗口：前2分钟 + 目标1分钟 + 后2分钟
+            start_sample = (target_minute - before) * sample
+            end_sample = (target_minute + 1 + after) * sample
+
+            if end_sample > len(signals):
+                break
+
+            segment_signal = signals[start_sample:end_sample]
+
+            # 预处理5分钟段
+            rri_tm, rri_signal, amp_tm, amp_signal = preprocess_ecg_segment(segment_signal, fs)
+
+            if rri_tm is None or len(rri_signal) < 10:
+                continue  # 跳过质量差的段
+
+            # 检查RRI的合理性（根据论文心率范围）
+            hr = 60 / rri_signal
+            if np.any(hr < 20) or np.any(hr > 300):
+                continue  # 跳过心率异常的段
+
+            # 归一化RRI和振幅（论文中提到归一化）
+            def normalize_to_unit(sig):
+                sig_min, sig_max = np.min(sig), np.max(sig)
+                if sig_max - sig_min > 1e-8:
+                    return (sig - sig_min) / (sig_max - sig_min)
+                else:
+                    return np.zeros_like(sig)
+
+            rri_normalized = normalize_to_unit(rri_signal)
+            amp_normalized = normalize_to_unit(amp_signal)
+
+            # 插值到900个点（论文3.2节明确提到）
+            try:
+                # 创建统一的时间轴：0到5分钟，900个点
+                interp_time = np.linspace(0, (before + 1 + after) * 60, segment_length)
+
+                # 使用样条插值（论文中可能使用）
+                if len(rri_tm) >= 4:
+                    rri_spline = splrep(rri_tm, rri_normalized, k=3)
+                    rri_interp = splev(interp_time, rri_spline, ext=1)
+                else:
+                    rri_interp = np.interp(interp_time, rri_tm, rri_normalized)
+
+                if len(amp_tm) >= 4:
+                    amp_spline = splrep(amp_tm, amp_normalized, k=3)
+                    amp_interp = splev(interp_time, amp_spline, ext=1)
+                else:
+                    amp_interp = np.interp(interp_time, amp_tm, amp_normalized)
+
+                # 检查插值结果
+                if np.any(np.isnan(rri_interp)) or np.any(np.isnan(amp_interp)):
+                    continue
+
+                # 存储处理后的特征（900个点的RRI和振幅）
+                processed_features = np.stack([rri_interp, amp_interp], axis=1)  # 形状: (900, 2)
+
+                # 存储原始数据格式（用于模型）
+                x_raw.append([(rri_tm, rri_normalized), (amp_tm, amp_normalized)])
+
+                # 标签处理（根据论文，使用AASM标准）
+                # 注意：论文中提到的标签是每分钟的注释
+                label_char = labels[target_minute] if target_minute < len(labels) else 'N'
+
+                if label_char in ['A', 'a']:
+                    y.append(1.0)  # 呼吸暂停
+                elif label_char in ['N', 'n', 'B', 'b']:
+                    y.append(0.0)  # 正常或边界
+                else:
+                    # 跳过未知标签
+                    continue
+
+                groups.append(name)
+                segment_durations.append((before + 1 + after) * 60)  # 5分钟
+
+            except Exception as e:
+                if is_test:
+                    print(f"  测试集插值错误 {name} 第{target_minute}分钟: {e}")
+                continue
+
+        except Exception as e:
+            if is_test and target_minute % 30 == 0:  # 每30分钟打印一次
+                print(f"  测试集处理错误 {name} 第{target_minute}分钟: {e}")
+            continue
+
+    return x_raw, y, groups, segment_durations
+
+
+# ========== 数据集划分（根据论文3.1节） ==========
+def get_dataset_split():
+    """
+    根据论文3.1节划分数据集：
+    - 训练集：35个记录（released set）
+    - 测试集：35个记录（withheld set）
+    按照PhysioNet的标准划分
+    """
+    print("=" * 60)
+    print("数据集划分（根据论文3.1节）")
+    print("=" * 60)
+
+    all_files = []
+    for file in os.listdir(base_dir):
+        if file.endswith('.dat'):
+            all_files.append(file[:-4])  # 去掉扩展名
+
+    # 根据PhysioNet标准划分
+    # a, b, c 开头为训练集，x开头为测试集
+    train_records = [r for r in all_files if r.startswith(('a', 'b', 'c'))]
+    test_records = [r for r in all_files if r.startswith('x')]
+
+    print(f"训练集记录（a,b,c开头）: {len(train_records)} 个")
+    print(f"测试集记录（x开头）: {len(test_records)} 个")
+
+    # 论文中提到的具体数字
+    print("\n论文中提到（Table 2）：")
+    print("训练集: 65个呼吸暂停段 + 1410个正常段 = 1475段")
+    print("测试集: 65个呼吸暂停段 + 521个正常段 = 586段")
+    print("总计: 13066个呼吸暂停段 + 21362个正常段 = 34428段")
+
+    return train_records, test_records
+
+
+# ========== 主处理函数 ==========
+def process_dataset(records, annotation_ext, is_test=False):
+    """处理整个数据集"""
+    x_all = []
+    y_all = []
+    groups_all = []
+
+    print(f"处理{'测试' if is_test else '训练'}集，共 {len(records)} 个记录...")
+
+    with ProcessPoolExecutor(max_workers=num_worker) as executor:
+        future_to_record = {}
+
+        for record in records:
+            try:
+                # 读取注释文件 - 修正：测试集使用.xws扩展名
+                annotation_path = os.path.join(base_dir, record)
+                annotation = wfdb.rdann(annotation_path, extension=annotation_ext)
+
+                # 提交处理任务
+                future = executor.submit(extract_5min_segment_features,
+                                         record, annotation.symbol, is_test)
+                future_to_record[future] = record
+
+            except Exception as e:
+                print(f"无法读取记录 {record} 的注释 {annotation_ext}: {e}")
+                continue
+
+        # 处理结果
+        for future in tqdm(as_completed(future_to_record),
+                           total=len(future_to_record),
+                           desc=f"{'测试' if is_test else '训练'}集处理"):
+            record = future_to_record[future]
+            try:
+                x_part, y_part, groups_part, durations = future.result()
+                x_all.extend(x_part)
+                y_all.extend(y_part)
+                groups_all.extend(groups_part)
+
+                if len(x_part) > 0:
+                    print(f"  {record}: 提取了 {len(x_part)} 个5分钟段")
+
+            except Exception as e:
+                print(f"处理记录 {record} 时出错: {e}")
+
+    return x_all, np.array(y_all), np.array(groups_all)
+
+
+# ========== 数据标准化（根据论文方法） ==========
+def standardize_features(x_features):
+    """
+    标准化特征（根据论文，可能使用标准化或归一化）
+    这里使用论文中可能使用的方法
+    """
+    if len(x_features) == 0:
+        return np.array([])
+
+    # 转换为numpy数组
+    # x_features是列表，每个元素是[(rri_tm, rri_signal), (amp_tm, amp_signal)]
+    # 我们需要提取插值后的特征
+
+    # 首先插值所有特征到统一长度
+    interp_time = np.linspace(0, 300, segment_length)  # 5分钟=300秒
+
+    processed_features = []
+    for (rri_tm, rri_signal), (amp_tm, amp_signal) in x_features:
+        try:
+            # 插值RRI
+            if len(rri_tm) >= 4:
+                rri_spline = splrep(rri_tm, rri_signal, k=3)
+                rri_interp = splev(interp_time, rri_spline, ext=1)
+            else:
+                rri_interp = np.interp(interp_time, rri_tm, rri_signal)
+
+            # 插值振幅
+            if len(amp_tm) >= 4:
+                amp_spline = splrep(amp_tm, amp_signal, k=3)
+                amp_interp = splev(interp_time, amp_spline, ext=1)
+            else:
+                amp_interp = np.interp(interp_time, amp_tm, amp_signal)
+
+            # 组合特征
+            combined = np.stack([rri_interp, amp_interp], axis=1)  # (900, 2)
+            processed_features.append(combined)
+
+        except Exception as e:
+            print(f"特征插值错误: {e}")
+            continue
+
+    if len(processed_features) == 0:
+        return np.array([])
+
+    features_array = np.array(processed_features)  # (n_samples, 900, 2)
+
+    # 标准化：每个特征通道独立标准化
+    standardized = np.zeros_like(features_array)
+
+    for channel in range(2):  # RRI和振幅两个通道
+        channel_data = features_array[:, :, channel]
+
+        # 计算均值和标准差
+        mean_val = np.mean(channel_data)
+        std_val = np.std(channel_data)
+
+        if std_val < 1e-8:
+            std_val = 1.0
+
+        # 标准化
+        standardized[:, :, channel] = (channel_data - mean_val) / std_val
+
+    return standardized
+
+
+# ========== 主程序 ==========
+if __name__ == "__main__":
+    print("=" * 60)
+    print("睡眠呼吸暂停检测 - 数据预处理")
+    print("根据论文方法: CNN-Transformer-LSTM for SA Detection")
+    print("=" * 60)
+
+    # 1. 获取数据集划分（根据论文）
+    train_records, test_records = get_dataset_split()
+
+    if not train_records:
+        print("错误: 未找到训练集记录！")
+        sys.exit(1)
+
+    # 2. 处理训练集（使用.apn注释）
+    print("\n" + "=" * 60)
+    print("处理训练集")
+    print("=" * 60)
+
+    train_x_raw, train_y, train_groups = process_dataset(
+        train_records, "apn", is_test=False
+    )
+
+    print(f"\n训练集处理完成: {len(train_x_raw)} 个5分钟段")
+
+    # 3. 处理测试集（使用.xws注释 - 修正点！）
+    print("\n" + "=" * 60)
+    print("处理测试集")
+    print("=" * 60)
+
+    if test_records:
+        # 尝试读取.xws注释文件
+        test_x_raw, test_y, test_groups = process_dataset(
+            test_records, "xws", is_test=True  # 修改为.xws
+        )
+        print(f"\n测试集处理完成: {len(test_x_raw)} 个5分钟段")
+    else:
+        print("警告: 没有测试集记录，将从训练集分割")
+        # 如果测试集为空，使用20%的训练集作为测试集
+        indices = list(range(len(train_x_raw)))
+        train_idx, test_idx = train_test_split(
+            indices, test_size=0.2, random_state=42, stratify=train_y
+        )
+
+        test_x_raw = [train_x_raw[i] for i in test_idx]
+        test_y = train_y[test_idx]
+        test_groups = train_groups[test_idx]
+
+        train_x_raw = [train_x_raw[i] for i in train_idx]
+        train_y = train_y[train_idx]
+        train_groups = train_groups[train_idx]
+
+        print(f"分割后: 训练集 {len(train_x_raw)} 段, 测试集 {len(test_x_raw)} 段")
+
+    # 4. 标准化特征
+    print("\n" + "=" * 60)
+    print("特征标准化")
+    print("=" * 60)
+
+    # 标准化训练集特征
+    train_x_standardized = standardize_features(train_x_raw)
+
+    # 使用训练集的参数标准化测试集
+    if test_x_raw:
+        # 计算训练集的标准化参数
+        interp_time = np.linspace(0, 300, segment_length)
+        train_features_for_params = []
+
+        for (rri_tm, rri_signal), (amp_tm, amp_signal) in train_x_raw:
+            try:
+                # 插值
+                if len(rri_tm) >= 4:
+                    rri_spline = splrep(rri_tm, rri_signal, k=3)
+                    rri_interp = splev(interp_time, rri_spline, ext=1)
+                else:
+                    rri_interp = np.interp(interp_time, rri_tm, rri_signal)
+
+                if len(amp_tm) >= 4:
+                    amp_spline = splrep(amp_tm, amp_signal, k=3)
+                    amp_interp = splev(interp_time, amp_spline, ext=1)
+                else:
+                    amp_interp = np.interp(interp_time, amp_tm, amp_signal)
+
+                combined = np.stack([rri_interp, amp_interp], axis=1)
+                train_features_for_params.append(combined)
+
+            except Exception as e:
+                continue
+
+        if train_features_for_params:
+            train_features_array = np.array(train_features_for_params)
+
+            # 计算训练集的标准化参数
+            standardization_params = []
+            for channel in range(2):
+                channel_data = train_features_array[:, :, channel]
+                mean_val = np.mean(channel_data)
+                std_val = np.std(channel_data)
+                if std_val < 1e-8:
+                    std_val = 1.0
+                standardization_params.append((mean_val, std_val))
+
+            # 标准化测试集
+            test_features_processed = []
+            for (rri_tm, rri_signal), (amp_tm, amp_signal) in test_x_raw:
+                try:
+                    # 插值
+                    if len(rri_tm) >= 4:
+                        rri_spline = splrep(rri_tm, rri_signal, k=3)
+                        rri_interp = splev(interp_time, rri_spline, ext=1)
+                    else:
+                        rri_interp = np.interp(interp_time, rri_tm, rri_signal)
+
+                    if len(amp_tm) >= 4:
+                        amp_spline = splrep(amp_tm, amp_signal, k=3)
+                        amp_interp = splev(interp_time, amp_spline, ext=1)
+                    else:
+                        amp_interp = np.interp(interp_time, amp_tm, amp_signal)
+
+                    # 使用训练集的参数标准化
+                    rri_standardized = (rri_interp - standardization_params[0][0]) / standardization_params[0][1]
+                    amp_standardized = (amp_interp - standardization_params[1][0]) / standardization_params[1][1]
+
+                    combined = np.stack([rri_standardized, amp_standardized], axis=1)
+                    test_features_processed.append(combined)
+
+                except Exception as e:
+                    continue
+
+            test_x_standardized = np.array(test_features_processed)
+        else:
+            test_x_standardized = standardize_features(test_x_raw)
+    else:
+        test_x_standardized = np.array([])
+
+    print(f"标准化后特征形状:")
+    print(f"训练集: {train_x_standardized.shape}")
+    print(f"测试集: {test_x_standardized.shape if len(test_x_standardized) > 0 else '空'}")
+
+    # 5. 数据统计（符合论文统计）
+    print("\n" + "=" * 60)
+    print("数据统计")
+    print("=" * 60)
+
+    train_apnea_count = np.sum(train_y == 1)
+    train_normal_count = np.sum(train_y == 0)
+
+    test_apnea_count = np.sum(test_y == 1) if len(test_y) > 0 else 0
+    test_normal_count = np.sum(test_y == 0) if len(test_y) > 0 else 0
+
+    print(f"训练集: {len(train_y)} 个样本")
+    print(f"  呼吸暂停: {train_apnea_count} ({train_apnea_count / len(train_y) * 100:.1f}%)")
+    print(f"  正常: {train_normal_count} ({train_normal_count / len(train_y) * 100:.1f}%)")
+
+    print(f"测试集: {len(test_y)} 个样本")
+    print(f"  呼吸暂停: {test_apnea_count} ({test_apnea_count / len(test_y) * 100:.1f}%)")
+    print(f"  正常: {test_normal_count} ({test_normal_count / len(test_y) * 100:.1f}%)")
+
+    # 检查是否与论文中的统计数据匹配
+    print("\n与论文统计数据对比:")
+    print("论文Table 2: 训练集 - 6514 SA + 10611 Normal = 17125 total")
+    print(f"实际: 训练集 - {train_apnea_count} SA + {train_normal_count} Normal = {len(train_y)} total")
+
+    # 6. 保存数据（格式符合论文实验）
+    print("\n" + "=" * 60)
+    print("保存数据")
+    print("=" * 60)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # 准备模型需要的数据格式
+    model_data = {
+        # 原始数据（用于模型预处理）
+        "o_train": train_x_raw,  # 原始(RRI_tm, RRI_signal), (ampl_tm, ampl_signal)
+        "y_train": train_y,
+        "groups_train": train_groups,
+        "o_test": test_x_raw if test_x_raw else [],
+        "y_test": test_y if len(test_y) > 0 else np.array([]),
+        "groups_test": test_groups if len(test_groups) > 0 else np.array([]),
+
+        # 标准化后的特征（可以直接用于训练）
+        "X_train_standardized": train_x_standardized,
+        "X_test_standardized": test_x_standardized,
+
+        # 元数据
+        "segment_length": segment_length,
+        "fs": fs,
+        "before": before,
+        "after": after,
+        "total_minutes": before + 1 + after,
+        "train_records": train_records,
+        "test_records": test_records,
+        "timestamp": timestamp,
+
+        # 论文相关信息
+        "paper_reference": "CNN-Transformer-LSTM for SA Detection",
+        "dataset": "PhysioNet Apnea-ECG",
+        "method": "Hamilton R-peak detection, RR interval extraction, 5-min segments",
+        "annotation_files": {
+            "train": "apn",
+            "test": "xws"  # 修正为.xws
+        }
+    }
+
+    # 保存到文件
+    output_path = os.path.join(base_dir, "apnea-ecg_processed.pkl")
+    with open(output_path, "wb") as f:
+        pickle.dump(model_data, f, protocol=4)
+
+    print(f"✓ 数据已保存到: {output_path}")
+
+    # 7. 生成报告
+    print("\n" + "=" * 60)
+    print("预处理报告")
+    print("=" * 60)
+
+    report = f"""
+    数据预处理完成 - 符合论文方法
+
+    重要修正:
+    ---------
+    - 测试集注释文件扩展名更正为: .xws (原代码错误地使用了.xwx)
+
+    论文方法摘要:
+    ------------
+    1. 数据: PhysioNet Apnea-ECG数据集
+    2. 预处理:
+       - 使用Hamilton算法检测R峰
+       - 计算RR间期和R峰振幅
+       - 5分钟段分析（前2分钟+目标1分钟+后2分钟）
+       - 中值滤波去除异常值
+       - 插值到900个点（每5分钟段）
+    3. 特征: RR间期 + R峰振幅
+    4. 标准化: Z-score标准化
+
+    处理结果:
+    ---------
+    训练集: {len(train_y)} 个5分钟段
+      呼吸暂停: {train_apnea_count} ({train_apnea_count / len(train_y) * 100:.1f}%)
+      正常: {train_normal_count} ({train_normal_count / len(train_y) * 100:.1f}%)
+
+    测试集: {len(test_y)} 个5分钟段
+      呼吸暂停: {test_apnea_count} ({test_apnea_count / len(test_y) * 100:.1f}%)
+      正常: {test_normal_count} ({test_normal_count / len(test_y) * 100:.1f}%)
+
+    特征维度:
+      每个样本: {segment_length} 时间点 × 2 特征 (RRI, Amplitude)
+
+    输出文件: {output_path}
+
+    数据文件说明:
+      - 训练集注释: .apn 文件
+      - 测试集注释: .xws 文件 (修正点)
+
+    下一步:
+      运行CNN-Transformer-LSTM模型进行训练和评估。
+    """
+
+    print(report)
+
+    # 保存报告
+    report_path = os.path.join(output_dir, f"preprocessing_report_{timestamp}.txt")
+    with open(report_path, "w") as f:
+        f.write(report)
+
+    print(f"✓ 详细报告保存到: {report_path}")
+    print("\n预处理完成！现在可以运行模型代码。")
